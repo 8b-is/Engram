@@ -120,6 +120,26 @@ def find_next_prime(start: int, seen_primes: set) -> int:
 
 if HAS_TORCH:
 
+    def _fast_rem_u64_vec(x: np.ndarray, bucket: PrimeBucketMod) -> np.ndarray:
+        """
+        Vectorized Lemire p/q (q = 2^64) fast remainder, bit-exact with
+        `PrimeBucketMod.fast_rem_u64` for `0 <= x < 2^32`.
+        """
+        xu = x.astype(np.uint64)
+        inv = np.uint64(bucket.inv_q64)
+        p = np.uint64(bucket.prime)
+        hi = xu * (inv >> np.uint64(32))
+        lo = xu * (inv & np.uint64(0xFFFFFFFF))
+        carry = (
+            (hi & np.uint64(0xFFFFFFFF)) + (lo >> np.uint64(32))
+            >= (np.uint64(1) << np.uint64(32))
+        ).astype(np.uint64)
+        q = (hi >> np.uint64(32)) + carry
+        rem = xu - q * p
+        rem = np.where(rem >= p, rem - p, rem)
+        rem = np.where(rem >= p, rem - p, rem)
+        return rem.astype(np.int64)
+
     class CompressedTokenizer:
         """
         Canonicalizer + lookup table compressor for token IDs.
@@ -356,10 +376,9 @@ if HAS_TORCH:
 
                 if self.use_pq_hash:
                     mix_u32 = ((mix.astype(np.uint64) ^ (mix.astype(np.uint64) >> np.uint64(32))) & np.uint64(0xFFFFFFFF))
-                    flat_u32 = mix_u32.reshape(-1).tolist()
                     for j in range(self.n_head_per_ngram):
                         b = pq_buckets[j]
-                        rem = np.array([b.fast_rem_u64(v) for v in flat_u32], dtype=np.int64).reshape(B, T)
+                        rem = _fast_rem_u64_vec(mix_u32.reshape(-1), b).reshape(B, T)
                         all_hashes.append(rem)
                 else:
                     for j in range(self.n_head_per_ngram):
@@ -497,6 +516,79 @@ if HAS_TORCH:
             m_x, exp_x = self.gather_bfp64_blocks(input_ids)
             return torch.ldexp(m_x.float(), exp_x.to(torch.int32))
 
+    class TorchMem8AdaptiveMultiHeadEmbedding(nn.Module):
+        """
+        MEM|8 Adaptive MultiHeadEmbedding in PyTorch: rows stay in `BFP-i8`
+        (`65 B/row`) while their relative reconstruction error is `<= tau`, and
+        promote to `BFP-i16` (`129 B/row`) when it exceeds `tau`.
+        """
+
+        def __init__(self, list_of_N: List[int], D: int = ENGRAM_HEAD_DIM, tau: float = 0.0052):
+            super().__init__()
+            self.num_heads = len(list_of_N)
+            self.embedding_dim = D
+            self.tau = float(tau)
+            offsets = [0]
+            for n in list_of_N[:-1]:
+                offsets.append(offsets[-1] + n)
+            self.register_buffer("offsets", torch.tensor(offsets, dtype=torch.long))
+
+            total_N = sum(list_of_N)
+            self.total_N = total_N
+            self.register_buffer("mantissas_i8", torch.zeros(total_N, D, dtype=torch.int8))
+            self.register_buffer("mantissas_i16", torch.zeros(total_N, D, dtype=torch.int16))
+            self.register_buffer("exponents", torch.full((total_N, 1), -9, dtype=torch.int8))
+            self.register_buffer("promoted", torch.zeros(total_N, dtype=torch.bool))
+
+        @classmethod
+        def from_float_embedding(
+            cls, dense_emb: MultiHeadEmbedding, tau: float = 0.0052
+        ) -> "TorchMem8AdaptiveMultiHeadEmbedding":
+            total_N, D = dense_emb.embedding.weight.shape
+            obj = cls.__new__(cls)
+            nn.Module.__init__(obj)
+            obj.num_heads = dense_emb.num_heads
+            obj.embedding_dim = D
+            obj.tau = float(tau)
+            obj.total_N = total_N
+            obj.register_buffer("offsets", dense_emb.offsets.clone())
+
+            w = dense_emb.embedding.weight.detach().float()
+            max_abs = w.abs().amax(dim=-1, keepdim=True).clamp_min(1e-18)
+
+            exp8 = torch.ceil(torch.log2(max_abs / 127.0)).clamp(-60, 60).to(torch.int8)
+            inv8 = torch.ldexp(torch.ones_like(max_abs), -exp8.to(torch.int32))
+            m8 = torch.round(w * inv8).clamp(-127, 127).to(torch.int8)
+
+            recon8 = torch.ldexp(m8.float(), exp8.to(torch.int32))
+            err_sq = (w - recon8).pow(2).sum(dim=-1, keepdim=True)
+            sig_sq = w.pow(2).sum(dim=-1, keepdim=True).clamp_min(1e-24)
+            promote = ((err_sq / sig_sq).sqrt() > tau).squeeze(-1)
+
+            exp16 = torch.ceil(torch.log2(max_abs / 32767.0)).clamp(-60, 60).to(torch.int8)
+            inv16 = torch.ldexp(torch.ones_like(max_abs), -exp16.to(torch.int32))
+            m16 = torch.round(w * inv16).clamp(-32767, 32767).to(torch.int16)
+
+            obj.register_buffer("mantissas_i8", m8)
+            obj.register_buffer("mantissas_i16", m16)
+            obj.register_buffer("exponents", torch.where(promote.unsqueeze(-1), exp16, exp8))
+            obj.register_buffer("promoted", promote)
+            return obj
+
+        @property
+        def promoted_count(self) -> int:
+            return int(self.promoted.sum().item())
+
+        def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+            shifted = input_ids + self.offsets
+            promoted = self.promoted[shifted].unsqueeze(-1)
+            m = torch.where(
+                promoted,
+                self.mantissas_i16[shifted].float(),
+                self.mantissas_i8[shifted].float(),
+            )
+            return torch.ldexp(m, self.exponents[shifted].to(torch.int32))
+
     class TorchTernaryLinearPq(nn.Module):
         """
         Ternary `{-1, 0, +1}` linear projection with group-64 rational `p/q` (`q = 2^20`)
@@ -590,10 +682,23 @@ if HAS_TORCH:
 
             if callable(mode):
                 self.multi_head_embedding = mode(list_of_N, head_dim, self.layer_id)
-            elif mode == "bfp64":
-                self.multi_head_embedding = TorchBfp64MultiHeadEmbedding(list_of_N=list_of_N, D=head_dim)
-            else:
+            elif mode == "dense":
                 self.multi_head_embedding = MultiHeadEmbedding(list_of_N=list_of_N, D=head_dim)
+            elif mode == "bfp64":
+                dense_emb = MultiHeadEmbedding(list_of_N=list_of_N, D=head_dim)
+                self.multi_head_embedding = TorchBfp64MultiHeadEmbedding.from_float_embedding(
+                    dense_emb
+                )
+            elif mode == "mem8_adaptive":
+                dense_emb = MultiHeadEmbedding(list_of_N=list_of_N, D=head_dim)
+                self.multi_head_embedding = (
+                    TorchMem8AdaptiveMultiHeadEmbedding.from_float_embedding(dense_emb)
+                )
+            else:
+                raise ValueError(
+                    f"Unknown embedding mode {mode!r}; expected 'dense', 'bfp64', "
+                    "'mem8_adaptive', or a callable (list_of_N, D, layer_id) -> nn.Module"
+                )
 
             self.short_conv = ShortConv(
                 hidden_size=b_cfg.hidden_size,

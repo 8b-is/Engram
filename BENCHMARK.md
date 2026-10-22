@@ -30,6 +30,11 @@ python3 engram_demo_v1.py
 | **Hardware `% prime` Modulo** (`engram_hash_ngram_mod_into`) | `20.90 µs` | `1.00×` | Baseline |
 | **Lemire `p/q` ($q = 2^{64}$) Reciprocal** (`engram_hash_ngram_pq_into`) | **`15.00 µs`** | **`1.39×` – `3.25×`** | **100.0% Bit-Exact** |
 
+> **Platform note:** these hashing latencies were measured on x86-64 Linux
+> (`dev-cx53`). The `p/q` win is CPU-dependent: on Apple Silicon
+> (aarch64-darwin) the hardware `% prime` path is faster (~`0.9×` for `p/q`).
+> Bucket equivalence is platform-independent and asserted by the bench.
+
 ### 2. Native 64-Dim `MultiHeadEmbedding` Table Compression (`D_head = 64 == BFP-64 Block Size`)
 
 | Configuration | Rows ($\sum N_h$) | Dense FP32 (`256 B/row`) | Omni `BFP-64` (`65 B/row`) | Compression |

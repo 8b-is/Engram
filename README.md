@@ -52,13 +52,17 @@ Full reproduction details and commands are documented in [BENCHMARK.md](BENCHMAR
 
 | Benchmark Stage | Baseline (Dense FP64 / `% prime`) | 8b-is Sovereign (`p/q` + `BFP-64`) | Speedup / Compression | Relative Error |
 |---|---|---|---|---|
-| **Multi-Head Prime Hashing** (`16,384` hashes) | `20.90 µs` (`% prime`) | **`15.00 µs`** (Lemire $p/q$, $q=2^{64}$) | **`1.39×` – `3.25×` faster** | **Bit-Exact (`0`)** |
+| **Multi-Head Prime Hashing** (`16,384` hashes) | `20.90 µs` (`% prime`) | **`15.00 µs`** (Lemire $p/q$, $q=2^{64}$) | **`1.39×` – `3.25×` faster** (x86-64 Linux) | **Bit-Exact (`0`)** |
 | **Engram Demo Table** (`10.34M × 64`) | `2.65 GB` (FP32) | **`0.67 GB`** (`BFP-64`, `65 B/row`) | **`3.94×` smaller** | `0.31%` |
 | **DeepSeek-V4.1 Table** (`384.0M × 64`) | `98.31 GB` (FP32) | **`24.96 GB`** (`BFP-64`, `65 B/row`) | **`3.94×` smaller** | `0.31%` |
 | **Isolated Head Projection** (`1024 -> 512`) | `208.70 µs` | **`35.65 µs`** (`i16 -> i64 -> Q16`) | **`5.85×` faster** | `0.00317` |
 | **MEM\|8 Adaptive Projection** (`1024 -> 512`) | `208.70 µs` | **`48.05 µs`** (`BFP-i8 -> BFP-i16`) | **`4.34×` faster** | **`0.00083`** |
 | **Full Engram Layer Step** (`2.62M` weights + Gate + Conv) | `1,282.36 µs` | **`190.11 µs`** (Int-Aligned `BFP-64`) | **`6.75×` faster** | `0.00021` |
 | **100% Zero-Float `p/q` Engram Step** (`Q16`) | `1,282.36 µs` | **`185.41 µs`** (**Zero Float Ops!**) | **`6.92×` faster** | **`0.00010`** |
+
+> Hashing speedups are platform-dependent: on Apple Silicon the `% prime` path
+> wins (~`0.9×` for `p/q`). Bucket equivalence and the projection/step error
+> numbers are platform-independent; see [BENCHMARK.md](BENCHMARK.md).
 
 ---
 

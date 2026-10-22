@@ -384,6 +384,14 @@ class NgramHashMappingPq:
         use_pq_hash: bool = True,
         fold_32bit: bool = False,
     ) -> Dict[int, List[List[List[int]]]]:
+        """
+        Hash compressed token IDs for every configured layer.
+
+        Note: `fold_32bit = True` folds the 64-bit mix to 32 bits before the
+        modulo (`mix ^ (mix >> 32)`), matching the Rust kernels. The upstream
+        `engram_demo_v1.py` baseline hashes the full 64-bit mix, so folded and
+        un-folded hashes intentionally differ.
+        """
         compressed = self.compressed_tokenizer(input_ids)
         return {
             lid: self._get_ngram_hashes_for_layer(
@@ -751,6 +759,10 @@ def fused_rmsnorm_gate(
 class EngramPq:
     """
     Pure-stdlib DeepSeek Engram module powered by Omni BFP-64 + Ternary p/q projections.
+
+    `fold_32bit` controls the mix folding used during hashing; the default
+    (`True`) matches the Rust kernels, while `False` hashes the full 64-bit mix
+    like the upstream demo.
     """
 
     def __init__(
@@ -767,10 +779,12 @@ class EngramPq:
         hidden_size: int = 256,
         hc_mult: int = 4,
         embedding_mode: str = "bfp64",
+        fold_32bit: bool = True,
     ):
         self.layer_id = int(layer_id)
         self.hidden_size = int(hidden_size)
         self.hc_mult = int(hc_mult)
+        self.fold_32bit = bool(fold_32bit)
         self.engram_hidden_size = (int(max_ngram_size) - 1) * int(n_embed_per_ngram)
         head_dim = int(n_embed_per_ngram) // int(n_head_per_ngram)
 
@@ -821,7 +835,9 @@ class EngramPq:
         input_ids:     [B][L]
         returns:       [B][L][HC_MULT][D]
         """
-        hash_batches = self.hash_mapping.hash(input_ids, use_pq_hash=True, fold_32bit=True)[self.layer_id]
+        hash_batches = self.hash_mapping.hash(
+            input_ids, use_pq_hash=True, fold_32bit=self.fold_32bit
+        )[self.layer_id]
         out_batches: List[List[List[List[float]]]] = []
 
         for b_idx, seq_hashes in enumerate(hash_batches):

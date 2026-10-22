@@ -159,6 +159,70 @@ class EngramSovereignTest(unittest.TestCase):
         self.assertEqual(len(out[0][0]), 4)
         self.assertEqual(len(out[0][0][0]), 64)
 
+    def test_numpy_vectorized_fast_rem_matches_scalar(self) -> None:
+        if not demo.HAS_TORCH:
+            self.skipTest("torch not installed")
+        import numpy as np
+
+        rng = random.Random(1234)
+        for p in [101, 1009, 10007, 65537, 646403, 1292809]:
+            bucket = pq.PrimeBucketMod.create(p, table_offset=0)
+            xs = np.array([rng.getrandbits(32) for _ in range(4096)], dtype=np.uint64)
+            got = demo._fast_rem_u64_vec(xs, bucket)
+            want = np.array([bucket.fast_rem_u64(int(v)) for v in xs], dtype=np.int64)
+            np.testing.assert_array_equal(got, want)
+
+    def test_torch_embedding_modes_dispatch(self) -> None:
+        if not demo.HAS_TORCH or not hasattr(demo.nn, "RMSNorm"):
+            self.skipTest("torch >= 2.4 required (nn.RMSNorm)")
+
+        def build(mode: str) -> demo.Engram:
+            cfg = demo.EngramConfig(
+                engram_vocab_size=[100, 120],
+                n_embed_per_ngram=64,
+                n_head_per_ngram=4,
+                layer_ids=[1],
+                tokenizer_name_or_path="offline",
+                embedding_mode=mode,
+            )
+            b_cfg = demo.BackBoneConfig(hidden_size=32, hc_mult=2)
+            return demo.Engram(layer_id=1, config=cfg, backbone_cfg=b_cfg)
+
+        self.assertIsInstance(build("dense").multi_head_embedding, demo.MultiHeadEmbedding)
+        self.assertIsInstance(
+            build("bfp64").multi_head_embedding, demo.TorchBfp64MultiHeadEmbedding
+        )
+        mem8 = build("mem8_adaptive").multi_head_embedding
+        self.assertIsInstance(mem8, demo.TorchMem8AdaptiveMultiHeadEmbedding)
+        self.assertGreaterEqual(mem8.promoted_count, 0)
+        self.assertEqual(mem8.total_N, mem8.mantissas_i8.shape[0])
+        with self.assertRaises(ValueError):
+            build("bogus_mode")
+
+    def test_engram_pq_fold_32bit_parameter(self) -> None:
+        base = dict(
+            engram_vocab_size=(256, 256),
+            max_ngram_size=3,
+            n_embed_per_ngram=512,
+            n_head_per_ngram=8,
+            layer_ids=(1,),
+            tokenizer_name_or_path="offline",
+            pad_id=2,
+            seed=3,
+            hidden_size=64,
+            hc_mult=2,
+        )
+        folded = pq.EngramPq(layer_id=1, fold_32bit=True, **base)
+        unfolded = pq.EngramPq(layer_id=1, fold_32bit=False, **base)
+        self.assertTrue(folded.fold_32bit)
+        self.assertFalse(unfolded.fold_32bit)
+
+        ids = [[0, 15, 260, 261, 300, 412, 19, 2]]
+        hidden = [[[[0.1 for _ in range(64)] for _ in range(2)] for _ in range(8)]]
+        out_folded = folded.forward(hidden, ids)
+        out_unfolded = unfolded.forward(hidden, ids)
+        self.assertNotEqual(out_folded, out_unfolded)
+
 
 if __name__ == "__main__":
     unittest.main()
