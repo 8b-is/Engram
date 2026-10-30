@@ -21,7 +21,7 @@ aliasing optimisation, and is unsound across thread migration.
   unreachable there by construction: it needs a foreign call and would break
   both the forbid and the zero-dependency posture.
 
-There is no file-backed snapshot to read, so no `SIGBUS` exposure exists today
+There is no file-backed snapshot to read, so no file-truncation exposure exists in these paths today
 and no code change is made.
 
 ## Invariant when node heads are persisted
@@ -37,7 +37,16 @@ Four layers, in this order:
 4. **Prefault and verify** — `MADV_WILLNEED`, then footer digest verification
    at open.
 
-Canonical, tested implementation: `8b-is/aurora` PR #5,
+Reference implementation: [Aurora PR #5](https://github.com/8b-is/aurora/pull/5),
 `tools/zero_copy_snapshot.py` (stdlib only, `AURSNAP1` format). A Python-side
 adapter is the natural fit here; the Rust crate would need a separate opt-in
 crate to keep `forbid(unsafe_code)` intact.
+
+## Limits of the mapping contract
+
+Immutable replacement protects readers only when all writers cooperate. Mode
+`0400` does not stop a privileged process, the owner changing permissions, or
+an already-open writable descriptor from truncating an inode. `MADV_WILLNEED`
+is advisory, and a successful digest check cannot prevent later I/O faults.
+Validate physical size before mapping and header bounds before exposing data;
+never treat these checks as a guarantee that `SIGBUS` is impossible.
